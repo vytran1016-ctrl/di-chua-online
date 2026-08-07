@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test: Chắp Tay Cầu Nguyện</title>
+    <style>
+        :root {
+            --bg-color: #1a1a1a;
+            --accent-color: #d4af37;
+        }
+
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: var(--bg-color);
+            overflow: hidden;
+            font-family: 'Times New Roman', serif;
+        }
+
+        /* Lớp UI tối giản cho bản test */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            z-index: 10; pointer-events: none;
+            display: flex; flex-direction: column; justify-content: space-between;
+            padding: 30px; box-sizing: border-box;
+        }
+
+        .status-box {
+            background: rgba(0,0,0,0.7); color: white;
+            padding: 15px 30px; border-radius: 10px; border: 1px solid var(--accent-color);
+            font-size: 1.5rem; text-align: center; width: max-content; margin: 0 auto;
+        }
+
+        #glow-status { color: #888; transition: 0.3s; font-weight: bold; }
+        #glow-status.active { color: var(--accent-color); text-shadow: 0 0 15px var(--accent-color); }
+
+        /* PIP Camera */
+        #pip-container {
+            width: 200px; height: 150px; background: #000; border-radius: 10px;
+            border: 1px solid var(--accent-color); overflow: hidden; position: relative;
+            align-self: flex-end; pointer-events: auto;
+        }
+        #webcam { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        #skeleton-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); pointer-events: none; }
+
+        /* Màn hình chờ */
+        #loading {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: var(--bg-color); z-index: 999; color: var(--accent-color);
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+        }
+        #start-btn {
+            margin-top: 20px; padding: 12px 30px; font-size: 1.2rem; cursor: pointer;
+            background: var(--accent-color); color: #111; border: none; border-radius: 8px; font-weight: bold;
+        }
+
+        #webgl-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+    </style>
+</head>
+<body>
+
+    <div id="loading">
+        <h1>Thử nghiệm Hào Quang</h1>
+        <p>Kiểm tra tính năng chắp tay cầu nguyện</p>
+        <button id="start-btn">Bật Camera</button>
+    </div>
+
+    <div id="ui-layer">
+        <div class="status-box">
+            Trạng thái: <span id="glow-status">Đang chờ cử chỉ...</span>
+        </div>
+        <div id="pip-container">
+            <video id="webcam" autoplay playsinline></video>
+            <canvas id="skeleton-canvas"></canvas>
+        </div>
+    </div>
+
+    <div id="webgl-container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { HandLandmarker, FilesetResolver, DrawingUtils } from '@mediapipe/tasks-vision';
+
+        // ==========================================
+        // 1. SETUP THREE.JS & ARTWORK
+        // ==========================================
+        const scene = new THREE.Scene();
+        // Căn chỉnh camera để lấy trọn vẹn bề ngang bức ảnh
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.z = 10;
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.getElementById('webgl-container').appendChild(renderer.domElement);
+
+        // Nạp ảnh buddah aw 1.jpg
+        const textureLoader = new THREE.TextureLoader();
+        const buddhaTexture = textureLoader.load('./buddah aw 1.jpg');
+        
+        // Khung ảnh 2D tỷ lệ 16:9
+        const geometry = new THREE.PlaneGeometry(16, 9); 
+
+        // Khai báo Shader Material để xử lý vùng phát sáng
+        let uniforms = {
+            tDiffuse: { value: buddhaTexture },
+            uGlowProgress: { value: 0.0 } // 0.0 là tắt, 1.0 là sáng rực
+        };
+
+        const material = new THREE.ShaderMaterial({
+            uniforms: uniforms,
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform float uGlowProgress;
+                varying vec2 vUv;
+
+                void main() {
+                    // Lấy màu gốc của bức ảnh
+                    vec4 texColor = texture2D(tDiffuse, vUv);
+                    
+                    // Tọa độ tâm bức ảnh (0.5, 0.5)
+                    vec2 center = vec2(0.5, 0.55); // Đẩy nhẹ lên trên một chút cho khớp vòng hào quang
+                    float dist = distance(vUv, center);
+                    
+                    // Tạo một vầng sáng mềm mại từ tâm tỏa ra (Radius ~ 0.3)
+                    // smoothstep: Nếu khoảng cách > 0.3 thì glow = 0, nếu < 0.1 thì glow = 1
+                    float glowIntensity = smoothstep(0.3, 0.0, dist) * uGlowProgress * 1.5;
+                    
+                    // Màu của ánh sáng phát ra (Vàng đồng rực rỡ)
+                    vec3 glowColor = vec3(1.0, 0.85, 0.4); 
+                    
+                    // Cộng gộp màu gốc với màu hào quang
+                    vec3 finalColor = texColor.rgb + (glowColor * glowIntensity);
+                    
+                    gl_FragColor = vec4(finalColor, texColor.a);
+                }
+            `
+        });
+
+        const planeMesh = new THREE.Mesh(geometry, material);
+        scene.add(planeMesh);
+
+        // Xử lý Responsive
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // ==========================================
+        // 2. MEDIAPIPE HAND TRACKING
+        // ==========================================
+        const video = document.getElementById('webcam');
+        const pipCanvas = document.getElementById('skeleton-canvas');
+        const canvasCtx = pipCanvas.getContext('2d');
+        let handLandmarker;
+        let lastVideoTime = -1;
+        const drawingUtils = new DrawingUtils(canvasCtx);
+
+        let isPraying = false;
+        let targetGlow = 0.0;
+        let currentGlow = 0.0;
+        const statusElement = document.getElementById('glow-status');
+
+        async function initSystem() {
+            document.getElementById('loading').style.display = 'none';
+            const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm");
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 2 // Nhận diện 2 tay
+            });
+
+            navigator.mediaDevices.getUserMedia({ video: true }).then((stream) => {
+                video.srcObject = stream;
+                video.addEventListener("loadeddata", () => {
+                    pipCanvas.width = video.videoWidth;
+                    pipCanvas.height = video.videoHeight;
+                    animate(); 
+                });
+            });
+        }
+
+        document.getElementById('start-btn').addEventListener('click', initSystem);
+
+        // ==========================================
+        // 3. VÒNG LẶP RENDER & CẬP NHẬT TRẠNG THÁI
+        // ==========================================
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (video.readyState >= 2) {
+                let startTimeMs = performance.now();
+                if (video.currentTime !== lastVideoTime) {
+                    lastVideoTime = video.currentTime;
+                    const results = handLandmarker.detectForVideo(video, startTimeMs);
+                    
+                    canvasCtx.save();
+                    canvasCtx.clearRect(0, 0, pipCanvas.width, pipCanvas.height);
+                    
+                    if (results.landmarks && results.landmarks.length > 0) {
+                        for (const landmarks of results.landmarks) {
+                            drawingUtils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS, { color: "#d4af37", lineWidth: 2 });
+                            drawingUtils.drawLandmarks(landmarks, { color: "#ffffff", lineWidth: 1, radius: 2 });
+                        }
+
+                        // LOGIC NHẬN DIỆN CHẮP TAY
+                        if (results.landmarks.length === 2) {
+                            const hand1 = results.landmarks[0];
+                            const hand2 = results.landmarks[1];
+
+                            // Tính khoảng cách giữa ngón trỏ và cổ tay
+                            const distIndex = Math.hypot(hand1[8].x - hand2[8].x, hand1[8].y - hand2[8].y);
+                            const distWrist = Math.hypot(hand1[0].x - hand2[0].x, hand1[0].y - hand2[0].y);
+
+                            if (distIndex < 0.15 && distWrist < 0.2) {
+                                isPraying = true;
+                                targetGlow = 1.0;
+                                statusElement.innerText = "Nam Mô A Di Đà Phật";
+                                statusElement.classList.add("active");
+                            } else {
+                                isPraying = false;
+                                targetGlow = 0.0;
+                                statusElement.innerText = "Đang chờ cử chỉ...";
+                                statusElement.classList.remove("active");
+                            }
+                        } else {
+                            isPraying = false;
+                            targetGlow = 0.0;
+                        }
+                    }
+                    canvasCtx.restore();
+                }
+            }
+
+            // Lerp (Nội suy) để vòng sáng tắt/bật một cách mượt mà và từ từ
+            currentGlow += (targetGlow - currentGlow) * 0.05;
+            uniforms.uGlowProgress.value = currentGlow;
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
